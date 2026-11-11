@@ -1,0 +1,22 @@
+# Build output, dependencies, and per-machine config never enter the repo.
+dist/
+node_modules/
+.env
+.env.*
+!.env.example
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Test artefacts
+coverage/
+.nyc_output/
