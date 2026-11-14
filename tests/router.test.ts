@@ -12,7 +12,14 @@ import { ResponseCache } from "../src/cache.js";
 import { TierChain } from "../src/chain.js";
 import { scan } from "../src/egress.js";
 import type { Provider, TierOutcome } from "../src/providers.js";
-import { buildKiloRequest, buildNimRequest, stripReasoningContent } from "../src/reasoning.js";
+import {
+  buildKiloRequest,
+  buildNimRequest,
+  nimCandidateFields,
+  parseUnsupportedParameters,
+  stripNimFields,
+  stripReasoningContent,
+} from "../src/reasoning.js";
 import type { ChatMessage } from "../src/types.js";
 
 const MESSAGES: ChatMessage[] = [{ role: "user", content: "Hello" }];
@@ -103,24 +110,72 @@ describe("NIM reasoning adapter", () => {
     apiKey: "nvapi-x",
     model: "stepfun-ai/step-5-preview",
     messages: MESSAGES,
+    reasoning: "high",
     reasoningBudget: 16384,
   };
 
-  it("sets stream false, enable_thinking, a budget, and headroom", () => {
+  it("always sets stream false, and sends the key", () => {
     const request = buildNimRequest(base);
     assert.equal(request.body.stream, false, "NIM defaults stream to true");
-    assert.deepEqual(request.body.chat_template_kwargs, { enable_thinking: true });
-    assert.equal(request.body.reasoning_budget, 16384);
-    assert.ok((request.body.max_tokens as number) >= 16384, "max_tokens needs headroom over the budget");
     assert.equal(request.headers.Authorization, "Bearer nvapi-x");
   });
 
+  it("sends every candidate field for an unknown model, so the 400 fallback can learn", () => {
+    const request = buildNimRequest(base);
+    assert.equal(request.body.reasoning_effort, "high", "Step 5's knob");
+    assert.equal(request.body.reasoning_budget, 16384, "Nemotron's knob");
+    assert.deepEqual(request.body.chat_template_kwargs, { enable_thinking: true });
+    assert.ok((request.body.max_tokens as number) >= 16384, "max_tokens needs headroom over the budget");
+  });
+
+  it("omits fields already known to be rejected, keeping the accepted one", () => {
+    const request = buildNimRequest({
+      ...base,
+      rejectedFields: new Set(["reasoning_budget", "chat_template_kwargs"]),
+    });
+    assert.equal(request.body.reasoning_budget, undefined);
+    assert.equal(request.body.chat_template_kwargs, undefined);
+    assert.equal(request.body.reasoning_effort, "high", "the accepted field must survive");
+  });
+
+  it("keeps max_tokens headroom only while the budget is still sent", () => {
+    assert.ok((buildNimRequest(base).body.max_tokens as number) >= 16384);
+    assert.equal(
+      buildNimRequest({ ...base, rejectedFields: new Set(["reasoning_budget"]) }).body.max_tokens,
+      8192,
+    );
+  });
+
   it("respects a caller-supplied larger max_tokens", () => {
-    const request = buildNimRequest({ ...base, maxTokens: 20480 });
-    assert.equal(request.body.max_tokens, 20480);
+    assert.equal(buildNimRequest({ ...base, maxTokens: 20480 }).body.max_tokens, 20480);
   });
 });
 
+describe("NIM rejection parsing", () => {
+  it("parses the fields named in NIM's 400 message", () => {
+    assert.deepEqual(
+      parseUnsupportedParameters('{"message":"Validation: Unsupported parameter(s): `reasoning_budget`"}'),
+      ["reasoning_budget"],
+    );
+  });
+
+  it("parses several fields at once", () => {
+    assert.deepEqual(
+      parseUnsupportedParameters("Unsupported parameter(s): `reasoning`, `reasoning_budget`"),
+      ["reasoning", "reasoning_budget"],
+    );
+  });
+
+  it("returns nothing for an unrelated error", () => {
+    assert.deepEqual(parseUnsupportedParameters("Internal error"), []);
+  });
+
+  it("strips the named fields from a request body", () => {
+    const body: Record<string, unknown> = { model: "m", reasoning_budget: 1, chat_template_kwargs: {}, keep: true };
+    stripNimFields(body, ["reasoning_budget", "chat_template_kwargs"]);
+    assert.deepEqual(body, { model: "m", keep: true });
+  });
+});
 describe("reasoning stripping", () => {
   it("strips Kilo-style reasoning and reasoning_details", () => {
     const raw = {

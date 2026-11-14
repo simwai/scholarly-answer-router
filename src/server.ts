@@ -18,8 +18,30 @@ import type { ChatMessage, RouterErrorBody } from "./types.js";
 
 const PROMPT_VERSION = "synth-2026-11-11.1";
 
+/**
+ * Sanitize lone surrogate characters (U+D800-U+DFFF) that would produce
+ * invalid JSON escapes when serialized. Search result content scraped from
+ * the web can contain these, and NIM's JSON parser rejects them.
+ */
+function sanitizeForJSON(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.replace(/[\uD800-\uDFFF]/g, "\uFFFD");
+  }
+  if (Array.isArray(value)) {
+    return value.map(sanitizeForJSON);
+  }
+  if (value !== null && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value)) {
+      result[key] = sanitizeForJSON(val);
+    }
+    return result;
+  }
+  return value;
+}
+
 function json(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body);
+  const payload = JSON.stringify(sanitizeForJSON(body));
   res.writeHead(status, {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(payload),

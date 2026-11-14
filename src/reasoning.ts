@@ -98,6 +98,32 @@ export function stripKiloReasoningFields(body: Record<string, unknown>): void {
   for (const field of KILO_REASONING_FIELDS) delete body[field];
 }
 
+export interface NimReasoningShape {
+  /** The reasoning fields to send, in preference order. */
+  fields: Array<"reasoning_effort" | "reasoning_budget" | "chat_template_kwargs">;
+}
+
+/**
+ * NIM reasoning shapes differ per model, and NIM does not publish which model
+ * accepts which field - it only says no, with a 400, after the fact.
+
+ * Verified live against `integrate.api.nvidia.com`:
+ * - `stepfun-ai/step-5-preview` (Step 5): accepts `reasoning_effort`;
+ *   REJECTS both `reasoning_budget` and `reasoning` with
+ *   "Unsupported parameter(s)". It reasons unconditionally (600B MoE).
+ * - `nvidia/nemotron-3.5-*` (Nemotron): accepts `reasoning_budget` plus
+ *   `chat_template_kwargs.enable_thinking`, per NVIDIA's own examples.
+ *
+ * So the adapter sends the most expressive shape it can, and retries once
+ * without whatever field the 400 names. That retry is what makes tier 1 usable
+ * at all: without it, a permanently-rejected field would disable the tier.
+ */
+const NIM_CANDIDATE_FIELDS: Array<string> = [
+  "reasoning_effort",
+  "reasoning_budget",
+  "chat_template_kwargs",
+];
+
 export function buildNimRequest(opts: {
   baseUrl: string;
   apiKey: string;
@@ -107,20 +133,27 @@ export function buildNimRequest(opts: {
   topP?: number;
   maxTokens?: number;
   seed?: number;
+  reasoning: string;
   reasoningBudget: number;
+  /** Fields already known to be rejected by this model, so they are not retried. */
+  rejectedFields?: Set<string>;
 }): UpstreamRequest {
-  // Budget must leave headroom inside max_tokens.
-  const maxTokens = Math.max(opts.maxTokens ?? opts.reasoningBudget, opts.reasoningBudget);
+  const reject = (field: string) => opts.rejectedFields?.has(field) ?? false;
   const body: Record<string, unknown> = {
     model: opts.model,
     messages: opts.messages,
     stream: false, // NIM defaults to true; explicit false is required
-    temperature: opts.temperature ?? 1,
+    temperature: opts.temperature ?? 0.2,
     top_p: opts.topP ?? 0.95,
-    max_tokens: maxTokens,
-    reasoning_budget: opts.reasoningBudget,
-    chat_template_kwargs: { enable_thinking: true },
+    max_tokens: opts.maxTokens ?? 8192,
   };
+
+  if (!reject("reasoning_effort")) body.reasoning_effort = opts.reasoning;
+  if (!reject("reasoning_budget")) {
+    body.reasoning_budget = opts.reasoningBudget;
+    body.max_tokens = Math.max(body.max_tokens as number, opts.reasoningBudget);
+  }
+  if (!reject("chat_template_kwargs")) body.chat_template_kwargs = { enable_thinking: true };
   if (opts.seed !== undefined) body.seed = opts.seed;
 
   return {
@@ -131,6 +164,29 @@ export function buildNimRequest(opts: {
     },
     body,
   };
+}
+
+/** Field names NIM names when rejecting an unsupported parameter. */
+export function nimCandidateFields(): string[] {
+  return NIM_CANDIDATE_FIELDS;
+}
+
+/**
+ * Parse NIM's "Unsupported parameter(s): `a`, `b`" message into field names.
+ */
+export function parseUnsupportedParameters(message: string): string[] {
+  const match = /Unsupported parameter\(s\):\s*([^"]+)/i.exec(message);
+  const captured = match?.[1];
+  if (!captured) return [];
+  return captured
+    .split(",")
+    .map((part) => part.trim().replace(/`/g, ""))
+    .filter(Boolean);
+}
+
+/** Strip fields from a request body by name. */
+export function stripNimFields(body: Record<string, unknown>, fields: string[]): void {
+  for (const field of fields) delete body[field];
 }
 
 /**
